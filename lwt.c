@@ -7,7 +7,7 @@
 #include <time.h>
 
 enum lwt_tag_states {
-    lwt_READY = 0, lwt_RUNNING, thrd_WAIT, sem_WAIT, lwt_SLEEP, lwt_EXIT, lwt_DEAD 
+    lwt_READY = 0, lwt_RUNNING, thrd_WAIT, sem_WAIT, lwt_SLEEP, lwt_EXIT
 };
 
 struct lwt_tag_thread{
@@ -15,12 +15,16 @@ struct lwt_tag_thread{
     char *stack;
     lwt_states state;
     char prior;     // priority, 0,1,2,3,4  default 2
-    int time;       // totally cpu time
+    useconds_t time;       // totally cpu time
     struct lwt_tag_thread *next; // next thread
-    lwt_tid tid;
+    int tid;
     lwt_f func;
     void *argv;
-    lwt_tid waitfor;    // waitfor a thread terminate
+    void *result;
+    int status;
+    struct lwt_tag_thread *waited;    // waited by some thread.
+    clock_t resume_time;    // when a thread is in lwt_SLEEP, it will be resumed when
+                            // the process time reach resume_time
 };
 struct lwt_tag_env{
     /* This struct contain all the necessary data that need by the lwt.
@@ -35,14 +39,20 @@ struct lwt_tag_env{
          * Since main is the first thread that inserted into the thread list, so it's also the head of list
          */
     lwt_thread *main;
-    lwt_tid ntid;
+    int ntid;
+    useconds_t interval;
 };
 
 
 struct lwt_tag_S{
     int s;
-    void* queue[];
+    int size;
+    lwt_thread **queue;
 };
+
+
+void lwt_sighandler(int signo);
+void lwt_exam_wait(lwt_thread *t);
 
 struct lwt_tag_env g_lwt_env;
 void lwt_init(){
@@ -68,8 +78,7 @@ void lwt_init(){
     g_lwt_env.current = ptrt;
     g_lwt_env.main = ptrt;
     g_lwt_env.ntid = 1;
-    //ualarm(lwt_QUANTUM, lwt_QUANTUM);
-    alarm(2);
+    ualarm(lwt_QUANTUM, 0);
     return ;
 }
 lwt_thread *lwt_create(lwt_f func, void *argv){
@@ -104,6 +113,9 @@ void lwt_run(lwt_thread *thread){
          * the new thread will be execuated when it have time slice.
          */
         thread->state = lwt_RUNNING;
+        /* 
+         * More note at http://blog.chengh.com/2013/09/modify-stack-frame-of-c/
+         */
         if(setjmp(g_lwt_env.current->env) ==0){
             g_lwt_env.current = thread;
             longjmp(thread->env, 1);
@@ -118,33 +130,159 @@ void lwt_run(lwt_thread *thread){
          */
         // change the stack, stack increcre from high to low address,
         // but the malloc memory begin at low address.
-        printf("switch stack, running");
-        p = g_lwt_env.current->stack + lwt_STACK_SIZE; 
+        //printf("switch stack, running");
+        #ifdef _X86
+        __asm__("mov %0, %%esp;": :"r"(g_lwt_env.current->stack + lwt_STACK_SIZE) );
+        #else
         __asm__("mov %0, %%rsp;": :"r"(g_lwt_env.current->stack + lwt_STACK_SIZE) );
+        #endif
         //__asm__("mov $0x100054000, %rsp");
         // rsp is for x64, esp is for x86
         g_lwt_env.current->func(g_lwt_env.current->argv);
-    
-        // some other work need to do.
+        g_lwt_env.current->state = lwt_EXIT;
+        ualarm(0,0);        // reset and raise to the handler
+        raise(SIGALRM);
+        
     }
 }
 
 void lwt_sighandler(int signo){
-    alarm(2);
-    printf("Enter %d\n", g_lwt_env.current->tid);
     if(setjmp(g_lwt_env.current->env) == 0){
-        g_lwt_env.current->time += lwt_QUANTUM;
+        g_lwt_env.current->time += g_lwt_env.interval;
         do{
             g_lwt_env.current = g_lwt_env.current->next;
+            switch(g_lwt_env.current->state){
+                case lwt_RUNNING:
+                    break;
+                case thrd_WAIT:         // the sem_WAIT will be changed on V operation.
+                    // exam whether the thread waited by current is terminated.
+                    // If yes, switch the curren to lwt_RUNNING
+                    lwt_exam_wait(g_lwt_env.current);
+                    break;
+                case lwt_SLEEP:
+                    if(clock() > g_lwt_env.current->resume_time)
+                        g_lwt_env.current->state = lwt_RUNNING;
+                    break;
+            }
+        }while(g_lwt_env.current->state != lwt_RUNNING);
+
+        g_lwt_env.interval = lwt_QUANTUM;
+        switch(g_lwt_env.current->prior){   // adjust the slice based on prior
+            case 1:
+                g_lwt_env.interval >> 1;
+                break;
+            case 2:
+                break;
+            case 3:
+                g_lwt_env.interval << 2;
+                break;
         }
-        while(g_lwt_env.current->state != lwt_RUNNING);
+        ualarm(g_lwt_env.interval, 0);
         // long jmp, 1 indicate that it's jumped, not return directly.
         longjmp(g_lwt_env.current->env, 1);
     }
-    printf("Out %d\n", g_lwt_env.current->tid);
     return;
 }
 
+void lwt_sleep(int s){
+    g_lwt_env.interval -=ualarm(0,0);       // make sure the running time is correct
+    g_lwt_env.current->state = lwt_SLEEP;
+    g_lwt_env.current->resume_time = clock() + s*CLOCKS_PER_SEC; // when to resume
+    raise(SIGALRM);
+    return;
+}
+int lwt_wait(lwt_thread *t){
+    g_lwt_env.interval -= ualarm(0,0);
+    g_lwt_env.current->state = thrd_WAIT;
+    t->waited = g_lwt_env.current;
+    raise(SIGALRM);
+    return t->status;;
+}
+void lwt_exit(int status){
+    g_lwt_env.current->status = status;
+    if(g_lwt_env.current == g_lwt_env.current->next)
+        exit(status);
+    g_lwt_env.current->state = lwt_EXIT;
+}
 
+int lwt_gettid(){
+    return g_lwt_env.current->tid;
+}
 
+void lwt_exam_wait(lwt_thread *t){
+    lwt_thread *p;
+    p = t; 
+    do{
+        p = p->next;
+        if(p->waited == t){
+            if(p->state == lwt_EXIT){
+                t->state = lwt_RUNNING;
+                break;
+            }
+        }
+    }while(p != t);
+    return;
+}
+lwt_S *lwt_createS(int ss){
+    lwt_S *s;
+    s = malloc(sizeof(lwt_S));
+    s->s=ss;
+    s->size = 5;
+    s->queue = malloc(sizeof(lwt_thread *) * s->size);
+    return s;
+}
 
+void lwt_P(lwt_S *s){
+    int left;
+    left = ualarm(0,0);
+    if(s->s >0){
+        s->s -=1;
+        ualarm(left,0);
+    }
+    else{
+        s->s -=1;
+        if ( s->size < abs(s->s)){
+            s->size +=5;
+            s->queue = realloc(s->queue, sizeof(lwt_thread *) * s->size);
+        }
+        g_lwt_env.current->state = sem_WAIT;
+        s->queue[abs(s->s)-1] = g_lwt_env.current;
+        raise(SIGALRM);
+    }
+    return;
+}
+
+void lwt_V(lwt_S *s){
+    int left;
+    left = ualarm(0,0);
+    if(s->s >= 0){
+        s->s +=1;
+    }
+    else{
+        s->s +=1;
+        s->queue[abs(s->s)]->state = lwt_RUNNING;
+    }
+    ualarm(left, 0);
+    return;
+}
+int lwt_getS(lwt_S *s){
+    return s->s;
+}
+void lwt_del(lwt_thread *t){
+    lwt_thread *pre;
+    pre = t;
+    if(t == t->next)
+        return;
+    while(pre->next !=t){
+        pre = pre->next;
+    }
+    pre->next = t->next;
+    free(t);
+    return;
+}
+void lwt_set_prior(lwt_thread *t, int prior){
+    if(prior >=1 && prior <=3)
+        t->prior = prior;
+    else
+        t->prior = 2;
+}

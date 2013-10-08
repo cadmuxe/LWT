@@ -1,3 +1,4 @@
 *.swp
 *.dSYM
 *.out
+.DS_Store
