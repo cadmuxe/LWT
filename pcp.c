@@ -22,7 +22,6 @@ void producter(){
         lwt_V(lock);
         lwt_V(full);
         printf("Thread %d, product:\t%d\n", lwt_gettid(), item);
-        lwt_sleep(1);
     }
 }
 
@@ -36,7 +35,6 @@ void consumer(){
         lwt_V(lock);
         lwt_V(empty);
         printf("Thread %d, consume:\t%d\n", lwt_gettid(), item);
-        lwt_sleep(1);
     }
 
 }

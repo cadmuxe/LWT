@@ -210,12 +210,14 @@ int lwt_gettid(){
 }
 
 void lwt_exam_wait(lwt_thread *t){
+    // find out which thred that t is waitting for.
+    // check those thread
     lwt_thread *p;
     p = t; 
     do{
         p = p->next;
         if(p->waited == t){
-            if(p->state == lwt_EXIT){
+            if(p->state == lwt_EXIT){ // if the thread, which t is waiting, finished, set t to lwt_RUNNING
                 t->state = lwt_RUNNING;
                 break;
             }
